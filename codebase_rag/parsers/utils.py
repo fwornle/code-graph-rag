@@ -91,6 +91,8 @@ def ingest_method(
     language: str = "",
     extract_decorators_func: Any = None,
     method_qualified_name: str | None = None,
+    get_comments_func: Any = None,
+    source_bytes: bytes | None = None,
 ) -> None:
     """Ingest a method node into the graph database.
 
@@ -105,6 +107,8 @@ def ingest_method(
         language: The programming language (used for C++ specific handling).
         extract_decorators_func: Optional function to extract decorators.
         method_qualified_name: Optional pre-computed qualified name to use instead of generating one.
+        get_comments_func: Optional function to extract comments from a node.
+        source_bytes: Optional source code bytes for comment extraction.
     """
     if language == "cpp":
         from .cpp_utils import extract_cpp_function_name
@@ -130,6 +134,13 @@ def ingest_method(
     if extract_decorators_func:
         decorators = extract_decorators_func(method_node)
 
+    comments = None
+    if get_comments_func and source_bytes:
+        try:
+            comments = get_comments_func(method_node, source_bytes, language)
+        except Exception:
+            pass  # Silently fail on comment extraction errors
+
     method_props: dict[str, Any] = {
         "qualified_name": method_qn,
         "name": method_name,
@@ -137,6 +148,7 @@ def ingest_method(
         "start_line": method_node.start_point[0] + 1,
         "end_line": method_node.end_point[0] + 1,
         "docstring": get_docstring_func(method_node),
+        "comments": comments,
     }
 
     logger.info(f"    Found Method: {method_name} (qn: {method_qn})")
@@ -161,6 +173,9 @@ def ingest_exported_function(
     simple_name_lookup: dict[str, set[str]],
     get_docstring_func: Any,
     is_export_inside_function_func: Any,
+    get_comments_func: Any = None,
+    source_bytes: bytes | None = None,
+    language: str = "",
 ) -> None:
     """Ingest an exported function into the graph database.
 
@@ -176,11 +191,21 @@ def ingest_exported_function(
         simple_name_lookup: Lookup table for simple names to qualified names.
         get_docstring_func: Function to extract docstring from a node.
         is_export_inside_function_func: Function to check if export is inside a function.
+        get_comments_func: Optional function to extract comments from a node.
+        source_bytes: Optional source code bytes for comment extraction.
+        language: The programming language.
     """
     if is_export_inside_function_func(function_node):
         return
 
     function_qn = f"{module_qn}.{function_name}"
+
+    comments = None
+    if get_comments_func and source_bytes:
+        try:
+            comments = get_comments_func(function_node, source_bytes, language)
+        except Exception:
+            pass  # Silently fail on comment extraction errors
 
     function_props = {
         "qualified_name": function_qn,
@@ -188,6 +213,7 @@ def ingest_exported_function(
         "start_line": function_node.start_point[0] + 1,
         "end_line": function_node.end_point[0] + 1,
         "docstring": get_docstring_func(function_node),
+        "comments": comments,
     }
 
     logger.info(f"  Found {export_type}: {function_name} (qn: {function_qn})")

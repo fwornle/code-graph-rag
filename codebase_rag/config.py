@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass
 from typing import Any
 
@@ -74,9 +75,17 @@ class AppConfig(BaseSettings):
     _active_cypher: ModelConfig | None = None
 
     def _get_default_config(self, role: str) -> ModelConfig:
-        """Determine default configuration for orchestrator or cypher."""
+        """Determine default configuration for orchestrator or cypher.
+
+        Priority order:
+        1. Role-specific environment variables (e.g., ORCHESTRATOR_PROVIDER)
+        2. GROQ_API_KEY - if set, use groq with llama-3.3-70b-versatile
+           (much better tool routing than small local models)
+        3. Fall back to local ollama with llama3.2
+        """
         role_upper = role.upper()
 
+        # Check for role-specific environment config first
         provider = getattr(self, f"{role_upper}_PROVIDER", None)
         model = getattr(self, f"{role_upper}_MODEL", None)
 
@@ -95,6 +104,17 @@ class AppConfig(BaseSettings):
                 ),
             )
 
+        # Prefer groq if GROQ_API_KEY is set (much better tool routing than llama3.2)
+        groq_key = os.getenv("GROQ_API_KEY")
+        if groq_key:
+            return ModelConfig(
+                provider="openai",  # groq uses OpenAI-compatible API
+                model_id="llama-3.3-70b-versatile",
+                endpoint="https://api.groq.com/openai/v1",
+                api_key=groq_key,
+            )
+
+        # Fall back to local ollama
         return ModelConfig(
             provider="ollama",
             model_id="llama3.2",

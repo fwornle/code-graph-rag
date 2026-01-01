@@ -4,9 +4,19 @@ services:
     ports:
       - "${MEMGRAPH_PORT:-7687}:7687"
       - "${MEMGRAPH_HTTP_PORT:-7444}:7444"
+    volumes:
+      - ./shared-data:/import
+      - memgraph-data:/var/lib/memgraph  # Persistent data - survives container restarts
+    restart: unless-stopped  # Auto-restart on failure or Docker restart
   lab:
     image: memgraph/lab
     ports:
       - "${LAB_PORT:-3000}:3000"
     environment:
       QUICK_CONNECT_MG_HOST: memgraph
+    restart: unless-stopped
+
+# Named volumes for data persistence
+volumes:
+  memgraph-data:
+    name: code-graph-rag-memgraph-data

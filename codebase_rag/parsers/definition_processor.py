@@ -218,6 +218,102 @@ class DefinitionProcessor:
                 return result
         return None
 
+    def _extract_all_comments(
+        self, node: Node, source_bytes: bytes, language: str
+    ) -> str | None:
+        """Extract all comments associated with a node.
+
+        This includes:
+        1. Preceding comment blocks (JSDoc, docblocks, etc.) - immediately before the node
+        2. Inline comments within the node body
+
+        Args:
+            node: The tree-sitter node (function, class, method)
+            source_bytes: The source code as bytes
+            language: The programming language
+
+        Returns:
+            Combined comments as a single string, or None if no comments found
+        """
+        comments = []
+
+        # Get preceding comments (JSDoc, docblocks above the node)
+        preceding = self._get_preceding_comments(node, source_bytes, language)
+        if preceding:
+            comments.extend(preceding)
+
+        # Get inline comments within the node body
+        inline = self._get_inline_comments(node, source_bytes, language)
+        if inline:
+            comments.extend(inline)
+
+        if not comments:
+            return None
+
+        return "\n".join(comments)
+
+    def _get_preceding_comments(
+        self, node: Node, source_bytes: bytes, language: str
+    ) -> list[str]:
+        """Get comment blocks immediately before this node.
+
+        Walks backwards from the node to find consecutive comment nodes.
+        Handles: //, /* */, #, ''', \"\"\"
+        """
+        comments = []
+        lang_config = LANGUAGE_FQN_CONFIGS.get(language)
+
+        # Get parent to search for siblings
+        parent = node.parent
+        if not parent:
+            return comments
+
+        # Find our index in the parent's children
+        node_index = -1
+        for i, child in enumerate(parent.children):
+            if child == node:
+                node_index = i
+                break
+
+        if node_index <= 0:
+            return comments
+
+        # Walk backwards to find comment nodes
+        for i in range(node_index - 1, -1, -1):
+            sibling = parent.children[i]
+            if sibling.type in ("comment", "line_comment", "block_comment", "multiline_comment"):
+                text = safe_decode_with_fallback(sibling).strip()
+                if text:
+                    comments.insert(0, text)  # Insert at front to maintain order
+            else:
+                # Stop at first non-comment node (excluding whitespace-like nodes)
+                break
+
+        return comments
+
+    def _get_inline_comments(
+        self, node: Node, source_bytes: bytes, language: str
+    ) -> list[str]:
+        """Get all comment nodes within the body of a function/class.
+
+        Traverses children to collect all comment-type nodes.
+        """
+        comments = []
+        comment_types = {"comment", "line_comment", "block_comment", "multiline_comment"}
+
+        # Use a stack-based traversal to find all comments within the node
+        stack = list(node.children)
+        while stack:
+            child = stack.pop()
+            if child.type in comment_types:
+                text = safe_decode_with_fallback(child).strip()
+                if text:
+                    comments.append(text)
+            # Add children in reverse order to process left-to-right
+            stack.extend(reversed(child.children))
+
+        return comments
+
     def _extract_decorators(self, node: Node) -> list[str]:
         """Extract decorator names from a decorated node."""
         decorators = []
@@ -425,6 +521,14 @@ class DefinitionProcessor:
                         )
 
             decorators = self._extract_decorators(func_node)
+            # Extract comments - read source if file_path available
+            comments = None
+            if file_path and file_path.exists():
+                try:
+                    source_bytes = file_path.read_bytes()
+                    comments = self._extract_all_comments(func_node, source_bytes, language)
+                except Exception:
+                    pass  # Silently fail if we can't read source for comments
             func_props: dict[str, Any] = {
                 "qualified_name": func_qn,
                 "name": func_name,
@@ -433,6 +537,7 @@ class DefinitionProcessor:
                 "end_line": func_node.end_point[0] + 1,
                 "docstring": self._get_docstring(func_node),
                 "is_exported": is_exported,
+                "comments": comments,
             }
             logger.info(f"  Found Function: {func_name} (qn: {func_qn})")
             self.ingestor.ensure_node_batch("Function", func_props)
@@ -763,6 +868,14 @@ class DefinitionProcessor:
                     method_cursor = QueryCursor(method_query)
                     method_captures = method_cursor.captures(body_node)
                     method_nodes = method_captures.get("function", [])
+                    # Get source bytes for comments extraction
+                    impl_file_path = self.module_qn_to_file_path.get(module_qn)
+                    impl_source_bytes = None
+                    if impl_file_path and impl_file_path.exists():
+                        try:
+                            impl_source_bytes = impl_file_path.read_bytes()
+                        except Exception:
+                            pass
                     for method_node in method_nodes:
                         if not isinstance(method_node, Node):
                             continue
@@ -776,6 +889,8 @@ class DefinitionProcessor:
                             self.simple_name_lookup,
                             self._get_docstring,
                             language,
+                            get_comments_func=self._extract_all_comments,
+                            source_bytes=impl_source_bytes,
                         )
 
                 continue
@@ -819,6 +934,15 @@ class DefinitionProcessor:
                     class_qn = nested_qn if nested_qn else f"{module_qn}.{class_name}"
 
             decorators = self._extract_decorators(class_node)
+            # Extract comments - read source if file_path available
+            comments = None
+            file_path = self.module_qn_to_file_path.get(module_qn)
+            if file_path and file_path.exists():
+                try:
+                    source_bytes = file_path.read_bytes()
+                    comments = self._extract_all_comments(class_node, source_bytes, language)
+                except Exception:
+                    pass  # Silently fail if we can't read source for comments
             class_props: dict[str, Any] = {
                 "qualified_name": class_qn,
                 "name": class_name,
@@ -827,6 +951,7 @@ class DefinitionProcessor:
                 "end_line": class_node.end_point[0] + 1,
                 "docstring": self._get_docstring(class_node),
                 "is_exported": is_exported,
+                "comments": comments,
             }
             if class_node.type == "interface_declaration":
                 node_type = "Interface"
@@ -925,6 +1050,13 @@ class DefinitionProcessor:
             method_cursor = QueryCursor(method_query)
             method_captures = method_cursor.captures(body_node)
             method_nodes = method_captures.get("function", [])
+            # Get source bytes for method comments extraction (reuse file_path from class loop)
+            method_source_bytes = None
+            if file_path and file_path.exists():
+                try:
+                    method_source_bytes = file_path.read_bytes()
+                except Exception:
+                    pass
             for method_node in method_nodes:
                 if not isinstance(method_node, Node):
                     continue
@@ -954,6 +1086,8 @@ class DefinitionProcessor:
                     language,
                     self._extract_decorators,
                     method_qualified_name,
+                    get_comments_func=self._extract_all_comments,
+                    source_bytes=method_source_bytes,
                 )
 
         for module_node in module_nodes:

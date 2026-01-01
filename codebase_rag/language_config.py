@@ -432,6 +432,13 @@ class LanguageConfig:
     class_query: str | None = None
     call_query: str | None = None
 
+    # Comment syntax configuration
+    line_comment: str = "#"  # Line comment prefix (# for Python, // for JS/C++)
+    block_comment_start: str = '"""'  # Block comment start (""" for Python, /* for C++)
+    block_comment_end: str = '"""'  # Block comment end (""" for Python, */ for C++)
+    # Tree-sitter node types for comments
+    comment_node_types: list[str] = field(default_factory=lambda: ["comment"])
+
 
 LANGUAGE_CONFIGS = {
     "python": create_lang_config(
@@ -443,6 +450,10 @@ LANGUAGE_CONFIGS = {
         import_node_types=["import_statement"],
         import_from_node_types=["import_from_statement"],
         package_indicators=["__init__.py"],
+        line_comment="#",
+        block_comment_start='"""',
+        block_comment_end='"""',
+        comment_node_types=["comment"],
     ),
     "javascript": create_lang_config(
         file_extensions=[".js", ".jsx"],
@@ -452,6 +463,10 @@ LANGUAGE_CONFIGS = {
         call_node_types=["call_expression"],
         import_node_types=COMMON_JS_TS_IMPORTS,
         import_from_node_types=COMMON_JS_TS_IMPORTS,
+        line_comment="//",
+        block_comment_start="/*",
+        block_comment_end="*/",
+        comment_node_types=["comment", "multiline_comment"],
     ),
     "typescript": create_lang_config(
         file_extensions=[".ts", ".tsx"],
@@ -468,6 +483,10 @@ LANGUAGE_CONFIGS = {
         call_node_types=["call_expression"],
         import_node_types=COMMON_JS_TS_IMPORTS,
         import_from_node_types=COMMON_JS_TS_IMPORTS,
+        line_comment="//",
+        block_comment_start="/*",
+        block_comment_end="*/",
+        comment_node_types=["comment", "multiline_comment"],
     ),
     "rust": create_lang_config(
         file_extensions=[".rs"],
@@ -495,6 +514,10 @@ LANGUAGE_CONFIGS = {
         import_node_types=["use_declaration", "extern_crate_declaration"],
         import_from_node_types=["use_declaration"],
         package_indicators=["Cargo.toml"],
+        line_comment="//",
+        block_comment_start="/*",
+        block_comment_end="*/",
+        comment_node_types=["line_comment", "block_comment"],
         function_query="""
         (function_item
             name: (identifier) @name) @function
@@ -539,6 +562,10 @@ LANGUAGE_CONFIGS = {
         call_node_types=["call_expression"],
         import_node_types=["import_declaration"],
         import_from_node_types=["import_declaration"],
+        line_comment="//",
+        block_comment_start="/*",
+        block_comment_end="*/",
+        comment_node_types=["comment"],
     ),
     "scala": create_lang_config(
         file_extensions=[".scala", ".sc"],
@@ -561,6 +588,10 @@ LANGUAGE_CONFIGS = {
         import_node_types=COMMON_DECLARATION_IMPORT,
         import_from_node_types=COMMON_DECLARATION_IMPORT,
         package_indicators=[],
+        line_comment="//",
+        block_comment_start="/*",
+        block_comment_end="*/",
+        comment_node_types=["comment", "block_comment"],
     ),
     "java": create_lang_config(
         file_extensions=[".java"],
@@ -580,6 +611,10 @@ LANGUAGE_CONFIGS = {
         call_node_types=["method_invocation"],
         import_node_types=COMMON_DECLARATION_IMPORT,
         import_from_node_types=COMMON_DECLARATION_IMPORT,
+        line_comment="//",
+        block_comment_start="/*",
+        block_comment_end="*/",
+        comment_node_types=["line_comment", "block_comment"],
         function_query="""
         (method_declaration
             name: (identifier) @name) @function
@@ -677,6 +712,10 @@ LANGUAGE_CONFIGS = {
     (new_expression) @call
     (delete_expression) @call
     """,
+        line_comment="//",
+        block_comment_start="/*",
+        block_comment_end="*/",
+        comment_node_types=["comment"],
     ),
     "c-sharp": create_lang_config(
         file_extensions=[".cs"],
@@ -699,6 +738,10 @@ LANGUAGE_CONFIGS = {
         call_node_types=["invocation_expression"],
         import_node_types=COMMON_USING_DIRECTIVE,
         import_from_node_types=COMMON_USING_DIRECTIVE,
+        line_comment="//",
+        block_comment_start="/*",
+        block_comment_end="*/",
+        comment_node_types=["comment"],
     ),
     "php": create_lang_config(
         file_extensions=[".php"],
@@ -721,6 +764,10 @@ LANGUAGE_CONFIGS = {
             "function_call_expression",
             "nullsafe_member_call_expression",
         ],
+        line_comment="//",
+        block_comment_start="/*",
+        block_comment_end="*/",
+        comment_node_types=["comment"],
     ),
     "lua": create_lang_config(
         file_extensions=[".lua"],
@@ -732,6 +779,10 @@ LANGUAGE_CONFIGS = {
         module_node_types=["chunk"],
         call_node_types=["function_call"],
         import_node_types=["function_call"],
+        line_comment="--",
+        block_comment_start="--[[",
+        block_comment_end="]]",
+        comment_node_types=["comment"],
     ),
 }
 

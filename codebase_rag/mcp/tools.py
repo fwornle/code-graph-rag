@@ -9,7 +9,8 @@ from loguru import logger
 from codebase_rag.graph_updater import GraphUpdater
 from codebase_rag.parser_loader import load_parsers
 from codebase_rag.services.graph_service import MemgraphIngestor
-from codebase_rag.services.llm import CypherGenerator
+from codebase_rag.services.llm import CypherGenerator, create_synthesis_agent
+from codebase_rag.tools.synthesis import ComprehensiveAnalyzer
 from codebase_rag.tools.code_retrieval import CodeRetriever, create_code_retrieval_tool
 from codebase_rag.tools.codebase_query import create_query_tool
 from codebase_rag.tools.directory_lister import (
@@ -59,6 +60,14 @@ class MCPToolsRegistry:
         self.file_reader = FileReader(project_root=project_root)
         self.file_writer = FileWriter(project_root=project_root)
         self.directory_lister = DirectoryLister(project_root=project_root)
+
+        # Comprehensive analysis with LLM synthesis
+        synthesis_agent = create_synthesis_agent()
+        self.comprehensive_analyzer = ComprehensiveAnalyzer(
+            ingestor=ingestor,
+            project_root=project_root,
+            synthesis_agent=synthesis_agent,
+        )
 
         self._query_tool = create_query_tool(
             ingestor=ingestor, cypher_gen=cypher_gen, console=None
@@ -204,6 +213,30 @@ class MCPToolsRegistry:
                 },
                 handler=self.list_directory,
                 returns_json=False,
+            ),
+            "comprehensive_analysis": ToolMetadata(
+                name="comprehensive_analysis",
+                description="Perform comprehensive LLM-powered analysis of a code entity. "
+                "Chains graph queries, source code reading, and LLM synthesis to provide "
+                "insights about purpose, patterns, dependencies, and potential issues.",
+                input_schema={
+                    "type": "object",
+                    "properties": {
+                        "qualified_name": {
+                            "type": "string",
+                            "description": "Fully qualified name of the entity to analyze "
+                            "(e.g., 'app.services.UserService')",
+                        },
+                        "scope": {
+                            "type": "string",
+                            "description": "Analysis depth: 'full', 'structure', 'behavior', or 'dependencies'",
+                            "default": "full",
+                        },
+                    },
+                    "required": ["qualified_name"],
+                },
+                handler=self.comprehensive_analysis,
+                returns_json=True,
             ),
         }
 
@@ -421,6 +454,51 @@ class MCPToolsRegistry:
         except Exception as e:
             logger.error(f"[MCP] Error listing directory: {e}")
             return f"Error: {str(e)}"
+
+    async def comprehensive_analysis(
+        self, qualified_name: str, scope: str = "full"
+    ) -> dict[str, Any]:
+        """Perform comprehensive LLM-powered analysis of a code entity.
+
+        This tool chains multiple operations:
+        1. Queries the knowledge graph for structure and relationships
+        2. Reads source code from relevant files
+        3. Aggregates documentation and comments
+        4. Uses LLM to synthesize insights
+
+        Args:
+            qualified_name: Fully qualified name of the entity
+                (e.g., 'app.services.UserService')
+            scope: Analysis depth - 'full', 'structure', 'behavior', 'dependencies'
+
+        Returns:
+            Dictionary containing:
+                - entity_name: The analyzed entity name
+                - entity_type: Type of entity (Class, Function, etc.)
+                - purpose: LLM-generated description of what the code does
+                - components: Key sub-components or methods
+                - patterns_identified: Design patterns found
+                - dependencies: What this entity depends on
+                - dependents: What depends on this entity
+                - potential_issues: Risks or concerns identified
+                - source_files: Files that were analyzed
+                - documentation: Aggregated docs and comments
+                - success: Whether analysis succeeded
+                - error_message: Error message if analysis failed
+        """
+        logger.info(f"[MCP] comprehensive_analysis: {qualified_name} (scope: {scope})")
+        try:
+            result = await self.comprehensive_analyzer.analyze(qualified_name, scope)
+            return cast(dict[str, Any], result.model_dump())
+        except Exception as e:
+            logger.error(f"[MCP] Error in comprehensive analysis: {e}", exc_info=True)
+            return {
+                "entity_name": qualified_name,
+                "entity_type": "Unknown",
+                "purpose": "Analysis failed",
+                "success": False,
+                "error_message": str(e),
+            }
 
     def get_tool_schemas(self) -> list[dict[str, Any]]:
         """Get MCP tool schemas for all registered tools.

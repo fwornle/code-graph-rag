@@ -1,3 +1,5 @@
+import csv
+from collections import defaultdict
 from pathlib import Path
 from typing import Any
 
@@ -182,3 +184,316 @@ class ProtobufFileIngestor:
             return self._flush_split()
         else:
             return self._flush_joint()
+
+
+class ProtobufIndexReader:
+    """
+    Reads and deserializes protobuf index files created by ProtobufFileIngestor.
+    Supports both joint (index.bin) and split (nodes.bin + relationships.bin) modes.
+    """
+
+    # Reverse mapping from oneof field to label
+    ONEOF_FIELD_TO_LABEL: dict[str, str] = {
+        v: k for k, v in ProtobufFileIngestor.LABEL_TO_ONEOF_FIELD.items()
+    }
+
+    # Map label to primary key property name
+    LABEL_TO_ID_PROPERTY: dict[str, str] = {
+        "Project": "name",
+        "Package": "qualified_name",
+        "Folder": "path",
+        "Module": "qualified_name",
+        "Class": "qualified_name",
+        "Function": "qualified_name",
+        "Method": "qualified_name",
+        "File": "path",
+        "ExternalPackage": "name",
+        "ModuleImplementation": "qualified_name",
+        "ModuleInterface": "qualified_name",
+    }
+
+    def __init__(self, index_path: str | Path):
+        """
+        Initialize the reader with a path to the index.
+
+        Args:
+            index_path: Path to index.bin file or directory containing
+                        nodes.bin and relationships.bin
+        """
+        self.index_path = Path(index_path)
+        self._nodes: list[pb.Node] = []
+        self._relationships: list[pb.Relationship] = []
+        self._mode: str | None = None  # 'joint' or 'split'
+
+    def detect_mode(self) -> str:
+        """
+        Detect whether index is in joint or split mode.
+
+        Returns:
+            'joint' if index.bin exists, 'split' if nodes.bin/relationships.bin exist
+
+        Raises:
+            FileNotFoundError: If no valid index files found
+        """
+        if self.index_path.is_file():
+            # Direct path to index.bin
+            self._mode = "joint"
+            return "joint"
+
+        if self.index_path.is_dir():
+            joint_file = self.index_path / "index.bin"
+            nodes_file = self.index_path / "nodes.bin"
+            rels_file = self.index_path / "relationships.bin"
+
+            if joint_file.exists():
+                self._mode = "joint"
+                return "joint"
+            elif nodes_file.exists() and rels_file.exists():
+                self._mode = "split"
+                return "split"
+
+        raise FileNotFoundError(
+            f"No valid index found at {self.index_path}. "
+            "Expected index.bin or nodes.bin + relationships.bin"
+        )
+
+    def load(self) -> tuple[list[pb.Node], list[pb.Relationship]]:
+        """
+        Load and deserialize the protobuf index.
+
+        Returns:
+            Tuple of (nodes, relationships) lists
+        """
+        if self._mode is None:
+            self.detect_mode()
+
+        if self._mode == "joint":
+            return self._load_joint()
+        else:
+            return self._load_split()
+
+    def _load_joint(self) -> tuple[list[pb.Node], list[pb.Relationship]]:
+        """Load from a single index.bin file."""
+        file_path = (
+            self.index_path
+            if self.index_path.is_file()
+            else self.index_path / "index.bin"
+        )
+
+        logger.info(f"Loading joint index from: {file_path}")
+
+        with open(file_path, "rb") as f:
+            data = f.read()
+
+        index = pb.GraphCodeIndex()
+        index.ParseFromString(data)
+
+        self._nodes = list(index.nodes)
+        self._relationships = list(index.relationships)
+
+        logger.info(
+            f"Loaded {len(self._nodes)} nodes and {len(self._relationships)} relationships"
+        )
+        return self._nodes, self._relationships
+
+    def _load_split(self) -> tuple[list[pb.Node], list[pb.Relationship]]:
+        """Load from separate nodes.bin and relationships.bin files."""
+        nodes_path = self.index_path / "nodes.bin"
+        rels_path = self.index_path / "relationships.bin"
+
+        logger.info(f"Loading split index from: {self.index_path}")
+
+        # Load nodes
+        with open(nodes_path, "rb") as f:
+            nodes_data = f.read()
+        nodes_index = pb.GraphCodeIndex()
+        nodes_index.ParseFromString(nodes_data)
+        self._nodes = list(nodes_index.nodes)
+
+        # Load relationships
+        with open(rels_path, "rb") as f:
+            rels_data = f.read()
+        rels_index = pb.GraphCodeIndex()
+        rels_index.ParseFromString(rels_data)
+        self._relationships = list(rels_index.relationships)
+
+        logger.info(
+            f"Loaded {len(self._nodes)} nodes and {len(self._relationships)} relationships"
+        )
+        return self._nodes, self._relationships
+
+    def extract_node_data(self, node: pb.Node) -> tuple[str, NodeProperties] | None:
+        """
+        Extract label and properties from a protobuf Node.
+
+        Args:
+            node: A protobuf Node message
+
+        Returns:
+            Tuple of (label, properties_dict) or None if invalid
+        """
+        # Determine which oneof field is set
+        field_name = node.WhichOneof("payload")
+        if not field_name:
+            logger.warning("Node has no payload set")
+            return None
+
+        label = self.ONEOF_FIELD_TO_LABEL.get(field_name)
+        if not label:
+            logger.warning(f"Unknown oneof field: {field_name}")
+            return None
+
+        # Get the payload message
+        payload = getattr(node, field_name)
+
+        # Extract all properties from the payload
+        properties: NodeProperties = {}
+        for field in payload.DESCRIPTOR.fields:
+            value = getattr(payload, field.name)
+            # Handle repeated fields (lists)
+            if field.label == field.LABEL_REPEATED:
+                properties[field.name] = list(value) if value else []
+            elif value or field.type == field.TYPE_BOOL:
+                # Include non-empty values and booleans
+                properties[field.name] = value
+
+        return label, properties
+
+    def extract_relationship_data(
+        self, rel: pb.Relationship
+    ) -> tuple[tuple[str, str, str], str, tuple[str, str, str], dict[str, Any]] | None:
+        """
+        Extract relationship data in MemgraphIngestor format.
+
+        Args:
+            rel: A protobuf Relationship message
+
+        Returns:
+            Tuple of (from_spec, rel_type, to_spec, properties) or None if invalid
+            - from_spec: (label, key_property, value)
+            - to_spec: (label, key_property, value)
+        """
+        # Get relationship type name from enum
+        rel_type_name = pb.Relationship.RelationshipType.Name(rel.type)
+        if rel_type_name == "RELATIONSHIP_TYPE_UNSPECIFIED":
+            logger.warning("Skipping relationship with unspecified type")
+            return None
+
+        source_label = rel.source_label
+        target_label = rel.target_label
+
+        if not source_label or not target_label:
+            logger.warning(
+                f"Relationship missing label: source={source_label}, target={target_label}"
+            )
+            return None
+
+        # Get the key property for each label
+        source_key = self.LABEL_TO_ID_PROPERTY.get(source_label)
+        target_key = self.LABEL_TO_ID_PROPERTY.get(target_label)
+
+        if not source_key or not target_key:
+            logger.warning(
+                f"Unknown label: source={source_label}, target={target_label}"
+            )
+            return None
+
+        # Build specs in MemgraphIngestor format
+        from_spec = (source_label, source_key, rel.source_id)
+        to_spec = (target_label, target_key, rel.target_id)
+
+        # Convert properties from protobuf Struct to dict
+        properties: dict[str, Any] = {}
+        if rel.properties:
+            for key, value in rel.properties.fields.items():
+                # Extract value from protobuf Value
+                if value.HasField("string_value"):
+                    properties[key] = value.string_value
+                elif value.HasField("number_value"):
+                    properties[key] = value.number_value
+                elif value.HasField("bool_value"):
+                    properties[key] = value.bool_value
+
+        return from_spec, rel_type_name, to_spec, properties
+
+    def export_to_csv(self, output_dir: Path) -> tuple[dict[str, Path], Path]:
+        """
+        Export protobuf index to CSV files for fast LOAD CSV import.
+
+        Creates one CSV file per node label in output_dir/nodes/ and a single
+        relationships.csv file. CSV format is optimized for Memgraph's LOAD CSV.
+
+        Args:
+            output_dir: Directory to write CSV files to
+
+        Returns:
+            Tuple of (node_files_dict, relationships_path)
+            - node_files_dict: {label: csv_path} mapping
+            - relationships_path: Path to relationships.csv
+        """
+        # Load the index if not already loaded
+        if not self._nodes:
+            self.load()
+
+        output_dir = Path(output_dir)
+        nodes_dir = output_dir / "nodes"
+        nodes_dir.mkdir(parents=True, exist_ok=True)
+
+        # Group nodes by label
+        nodes_by_label: dict[str, list[NodeProperties]] = defaultdict(list)
+        for node in self._nodes:
+            result = self.extract_node_data(node)
+            if result:
+                label, props = result
+                # Convert list values to comma-separated strings for CSV
+                csv_props = {}
+                for key, value in props.items():
+                    if isinstance(value, list):
+                        csv_props[key] = ",".join(str(v) for v in value)
+                    else:
+                        csv_props[key] = value
+                nodes_by_label[label].append(csv_props)
+
+        # Write one CSV per label
+        node_files: dict[str, Path] = {}
+        for label, props_list in nodes_by_label.items():
+            if not props_list:
+                continue
+
+            csv_path = nodes_dir / f"{label.lower()}.csv"
+
+            # Collect all field names across all nodes of this label
+            all_fields: set[str] = set()
+            for props in props_list:
+                all_fields.update(props.keys())
+
+            fieldnames = sorted(all_fields)
+
+            with open(csv_path, "w", newline="", encoding="utf-8") as f:
+                writer = csv.DictWriter(f, fieldnames=fieldnames, extrasaction="ignore")
+                writer.writeheader()
+                for props in props_list:
+                    writer.writerow(props)
+
+            node_files[label] = csv_path
+            logger.info(f"Exported {len(props_list)} {label} nodes to {csv_path}")
+
+        # Write relationships CSV
+        rels_path = output_dir / "relationships.csv"
+        with open(rels_path, "w", newline="", encoding="utf-8") as f:
+            writer = csv.writer(f)
+            writer.writerow(["from_id", "to_id", "rel_type", "from_label", "to_label"])
+
+            rel_count = 0
+            for rel in self._relationships:
+                result = self.extract_relationship_data(rel)
+                if result:
+                    from_spec, rel_type, to_spec, _ = result
+                    from_label, _, from_id = from_spec
+                    to_label, _, to_id = to_spec
+                    writer.writerow([from_id, to_id, rel_type, from_label, to_label])
+                    rel_count += 1
+
+        logger.info(f"Exported {rel_count} relationships to {rels_path}")
+
+        return node_files, rels_path

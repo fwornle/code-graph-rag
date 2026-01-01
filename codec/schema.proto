@@ -208,6 +208,7 @@ message GraphCodeIndex {
     int32 end_line = 5;
     repeated string decorators = 6;
     bool is_exported = 7;
+    string comments = 8;  // All comments: preceding block + inline comments
   }
 
   message Method {
@@ -219,6 +220,7 @@ message GraphCodeIndex {
     int32 start_line = 4;
     int32 end_line = 5;
     repeated string decorators = 6;
+    string comments = 7;  // All comments: preceding block + inline comments
   }
 
   message Class {
@@ -231,4 +233,5 @@ message GraphCodeIndex {
     int32 end_line = 5;
     repeated string decorators = 6;
     bool is_exported = 7;
+    string comments = 8;  // All comments: preceding block + inline comments
   }

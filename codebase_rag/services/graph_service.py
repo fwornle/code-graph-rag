@@ -327,3 +327,126 @@ class MemgraphIngestor:
     def _get_current_timestamp(self) -> str:
         """Get current timestamp in ISO format."""
         return datetime.now(UTC).isoformat()
+
+    def bulk_load_csv(
+        self, node_files: dict[str, "Path"], rels_path: "Path", skip_relationships: bool = False
+    ) -> dict[str, int]:
+        """
+        Bulk load nodes and relationships from CSV files using LOAD CSV.
+
+        This is significantly faster than individual MERGE queries for large datasets.
+        Expects CSV files to be in a Docker-mounted directory accessible as /import/.
+
+        Args:
+            node_files: Dictionary mapping label names to CSV file paths
+            rels_path: Path to relationships CSV file
+
+        Returns:
+            Dictionary with 'nodes' and 'relationships' counts
+        """
+        from pathlib import Path
+
+        stats = {"nodes": 0, "relationships": 0, "nodes_failed": 0, "rels_failed": 0}
+
+        # Load nodes by label
+        for label, csv_path in node_files.items():
+            filename = Path(csv_path).name
+            id_prop = self.unique_constraints.get(label, "qualified_name")
+
+            # Use LOAD CSV FROM file path inside Docker container
+            # The ./shared-data directory is mounted as /import
+            query = f"""
+            LOAD CSV FROM '/import/nodes/{filename}' WITH HEADER AS row
+            CREATE (n:{label})
+            SET n = row
+            """
+
+            try:
+                self._execute_query(query)
+                # Count nodes created for this label
+                count_result = self._execute_query(
+                    f"MATCH (n:{label}) RETURN count(n) as cnt"
+                )
+                label_count = count_result[0]["cnt"] if count_result else 0
+                logger.info(f"Loaded {label_count} {label} nodes via LOAD CSV")
+                stats["nodes"] += label_count
+            except Exception as e:
+                logger.error(f"Failed to load {label} nodes: {e}")
+                stats["nodes_failed"] += 1
+
+        # Skip relationships if requested (for fast nodes-only loading)
+        if skip_relationships:
+            logger.info("Skipping relationship loading (--nodes-only mode)")
+            return stats
+
+        # Build node ID cache for O(1) lookups (key optimization!)
+        # Internal ID matching is ~100x faster than property-based MATCH
+        logger.info("Building node ID cache for fast relationship loading...")
+        id_cache: dict[tuple[str, str], int] = {}
+        for label in self.unique_constraints.keys():
+            prop = self.unique_constraints[label]
+            query = f"MATCH (n:{label}) RETURN n.{prop} AS key, id(n) AS node_id"
+            try:
+                results = self._execute_query(query)
+                for row in results:
+                    if row["key"]:
+                        id_cache[(label, row["key"])] = row["node_id"]
+            except Exception as e:
+                logger.warning(f"Failed to cache {label} IDs: {e}")
+        logger.info(f"Cached {len(id_cache):,} node IDs")
+
+        # Load relationships using ID-based matching (much faster)
+        import csv
+
+        try:
+            # Read CSV and resolve to node IDs immediately
+            rels_by_type: dict[str, list[tuple[int, int]]] = defaultdict(list)
+            missing_nodes = 0
+            with open(rels_path, "r", encoding="utf-8") as f:
+                reader = csv.DictReader(f)
+                for row in reader:
+                    from_key = (row["from_label"], row["from_id"])
+                    to_key = (row["to_label"], row["to_id"])
+                    from_node_id = id_cache.get(from_key)
+                    to_node_id = id_cache.get(to_key)
+                    if from_node_id is not None and to_node_id is not None:
+                        rels_by_type[row["rel_type"]].append((from_node_id, to_node_id))
+                    else:
+                        missing_nodes += 1
+
+            if missing_nodes:
+                logger.warning(f"Skipped {missing_nodes} relationships due to missing nodes")
+
+            # Process each relationship type with ID-based batches
+            batch_size = self.batch_size
+            for rel_type, id_pairs in rels_by_type.items():
+                total_created = 0
+                for i in range(0, len(id_pairs), batch_size):
+                    batch = id_pairs[i : i + batch_size]
+                    batch_params = [{"from_id": p[0], "to_id": p[1]} for p in batch]
+
+                    # Use ID-based matching - O(1) direct memory access
+                    query = f"""
+                    UNWIND $batch AS row
+                    MATCH (a) WHERE id(a) = row.from_id
+                    MATCH (b) WHERE id(b) = row.to_id
+                    CREATE (a)-[r:{rel_type}]->(b)
+                    RETURN count(r) as created
+                    """
+
+                    try:
+                        result = self._execute_query(query, {"batch": batch_params})
+                        created = result[0]["created"] if result else 0
+                        total_created += created
+                    except Exception as e:
+                        logger.warning(f"Batch failed for {rel_type}: {e}")
+                        stats["rels_failed"] += 1
+
+                logger.info(f"Loaded {total_created} {rel_type} relationships")
+                stats["relationships"] += total_created
+
+        except Exception as e:
+            logger.error(f"Failed to load relationships: {e}")
+            stats["rels_failed"] += 1
+
+        return stats

@@ -1,6 +1,7 @@
 import asyncio
 import difflib
 import json
+import re
 import shlex
 import shutil
 import sys
@@ -30,8 +31,8 @@ from .graph_updater import GraphUpdater
 from .parser_loader import load_parsers
 from .services import QueryProtocol
 from .services.graph_service import MemgraphIngestor
-from .services.llm import CypherGenerator, create_rag_orchestrator
-from .services.protobuf_service import ProtobufFileIngestor
+from .services.llm import CypherGenerator, create_rag_orchestrator, create_synthesis_agent
+from .services.protobuf_service import ProtobufFileIngestor, ProtobufIndexReader
 from .tools.code_retrieval import CodeRetriever, create_code_retrieval_tool
 from .tools.codebase_query import create_query_tool
 from .tools.directory_lister import DirectoryLister, create_directory_lister_tool
@@ -45,8 +46,60 @@ from .tools.semantic_search import (
     create_semantic_search_tool,
 )
 from .tools.shell_command import ShellCommander, create_shell_command_tool
+from .tools.synthesis import ComprehensiveAnalyzer, create_comprehensive_analysis_tool
 
 confirm_edits_globally = True
+
+# Module-level tool registry for direct invocation (used for Llama format fallback)
+_tool_registry: dict[str, Any] = {}
+
+
+def _parse_llama_tool_call(failed_generation: str) -> tuple[str, dict[str, Any]] | None:
+    """Parse Llama's native function call format when Groq's tool calling fails.
+
+    Llama models output tool calls in various formats:
+    - <function=tool_name{"arg": "value"}</function>
+    - <function=tool_name={"arg": "value"}</function>  (with extra =)
+    - <function=tool_name {"arg": "value"}</function>  (with space)
+
+    Returns (tool_name, args_dict) if successfully parsed, None otherwise.
+    """
+    # Try multiple regex patterns to handle format variations
+    patterns = [
+        r"<function=(\w+)\s*(\{.*?\})</function>",      # Standard: tool_name{...}
+        r"<function=(\w+)=\s*(\{.*?\})</function>",     # With extra =: tool_name={...}
+        r"<function=(\w+)\s+(\{.*?\})</function>",      # With space: tool_name {...}
+    ]
+
+    for pattern in patterns:
+        match = re.search(pattern, failed_generation, re.DOTALL)
+        if match:
+            tool_name = match.group(1)
+            try:
+                args = json.loads(match.group(2))
+                return tool_name, args
+            except json.JSONDecodeError:
+                logger.warning(f"Failed to parse tool args JSON: {match.group(2)}")
+                continue
+    return None
+
+
+async def _execute_tool_directly(
+    tool_name: str, tool_args: dict[str, Any]
+) -> str | None:
+    """Execute a registered tool directly and return result as string."""
+    if tool_name not in _tool_registry:
+        logger.error(f"Tool '{tool_name}' not found in registry")
+        return None
+
+    tool_func = _tool_registry[tool_name]
+    try:
+        result = await tool_func(**tool_args)
+        return str(result)
+    except Exception as e:
+        logger.error(f"Error executing tool {tool_name}: {e}", exc_info=True)
+        return f"Error executing {tool_name}: {e}"
+
 
 app = typer.Typer(
     name="graph-code",
@@ -611,6 +664,49 @@ async def run_chat_loop(
         except KeyboardInterrupt:
             break
         except Exception as e:
+            error_str = str(e)
+            # Check if this is a Groq/Llama tool call format error
+            if "tool_use_failed" in error_str and "failed_generation" in error_str:
+                # Try to extract the Llama format tool call (handles multiple format variations)
+                # Patterns: tool_name{...}, tool_name={...}, tool_name {...}
+                match = re.search(
+                    r"'failed_generation':\s*'(<function=\w+[=\s]*\{.*?\}</function>)",
+                    error_str,
+                    re.DOTALL,
+                )
+                if match:
+                    llama_call = match.group(1)
+                    parsed = _parse_llama_tool_call(llama_call)
+                    if parsed:
+                        tool_name, tool_args = parsed
+                        console.print(
+                            f"\n[bold yellow]⚡ Detected Llama format tool call: {tool_name}[/bold yellow]"
+                        )
+                        console.print(
+                            f"[dim]Args: {json.dumps(tool_args, indent=2)}[/dim]"
+                        )
+
+                        # Execute the tool directly (we're already in async context)
+                        with console.status(
+                            f"[bold cyan]Executing {tool_name}...[/bold cyan]"
+                        ):
+                            result = await _execute_tool_directly(tool_name, tool_args)
+
+                        if result:
+                            console.print(
+                                Panel(
+                                    Markdown(result),
+                                    title=f"[bold green]{tool_name} Result[/bold green]",
+                                    border_style="green",
+                                )
+                            )
+                            log_session_event(f"TOOL RESULT ({tool_name}): {result}")
+                        else:
+                            console.print(
+                                f"[bold red]Failed to execute tool: {tool_name}[/bold red]"
+                            )
+                        continue
+
             logger.error("An unexpected error occurred: {}", e, exc_info=True)
             console.print(f"[bold red]An unexpected error occurred: {e}[/bold red]")
 
@@ -724,6 +820,14 @@ def _initialize_services_and_agent(repo_path: str, ingestor: QueryProtocol) -> A
     directory_lister = DirectoryLister(project_root=repo_path)
     document_analyzer = DocumentAnalyzer(project_root=repo_path)
 
+    # Comprehensive analysis with LLM synthesis
+    synthesis_agent = create_synthesis_agent()
+    comprehensive_analyzer = ComprehensiveAnalyzer(
+        ingestor=ingestor,
+        project_root=repo_path,
+        synthesis_agent=synthesis_agent,
+    )
+
     query_tool = create_query_tool(ingestor, cypher_generator, console)
     code_tool = create_code_retrieval_tool(code_retriever)
     file_reader_tool = create_file_reader_tool(file_reader)
@@ -734,21 +838,33 @@ def _initialize_services_and_agent(repo_path: str, ingestor: QueryProtocol) -> A
     document_analyzer_tool = create_document_analyzer_tool(document_analyzer)
     semantic_search_tool = create_semantic_search_tool()
     function_source_tool = create_get_function_source_tool()
+    synthesis_tool = create_comprehensive_analysis_tool(comprehensive_analyzer)
 
-    rag_agent = create_rag_orchestrator(
-        tools=[
-            query_tool,
-            code_tool,
-            file_reader_tool,
-            file_writer_tool,
-            file_editor_tool,
-            shell_command_tool,
-            directory_lister_tool,
-            document_analyzer_tool,
-            semantic_search_tool,
-            function_source_tool,
-        ]
-    )
+    tools = [
+        query_tool,
+        code_tool,
+        file_reader_tool,
+        file_writer_tool,
+        file_editor_tool,
+        shell_command_tool,
+        directory_lister_tool,
+        document_analyzer_tool,
+        semantic_search_tool,
+        function_source_tool,
+        synthesis_tool,
+    ]
+
+    # Register tools in global registry for Llama format fallback
+    global _tool_registry
+    for tool in tools:
+        if hasattr(tool, "function"):
+            func = tool.function
+            func_name = getattr(func, "__name__", None)
+            if func_name:
+                _tool_registry[func_name] = func
+                logger.debug(f"Registered tool in fallback registry: {func_name}")
+
+    rag_agent = create_rag_orchestrator(tools=tools)
     return rag_agent
 
 
@@ -914,6 +1030,187 @@ def index(
     except Exception as e:
         console.print(f"[bold red]An error occurred during indexing: {e}[/bold red]")
         logger.error("Indexing failed", exc_info=True)
+        raise typer.Exit(1)
+
+
+@app.command(name="load-index")
+def load_index(
+    index_path: str = typer.Argument(
+        ..., help="Path to index.bin file or directory containing index files"
+    ),
+    clean: bool = typer.Option(
+        False,
+        "--clean",
+        help="Clear database before loading (recommended for fresh start)",
+    ),
+    fast: bool = typer.Option(
+        True,
+        "--fast/--slow",
+        help="Use fast CSV bulk loading (requires Docker volume mount) or slow individual MERGE queries",
+    ),
+    nodes_only: bool = typer.Option(
+        False,
+        "--nodes-only",
+        help="Load only nodes, skip relationships (~1 second instead of 7+ minutes)",
+    ),
+    batch_size: int | None = typer.Option(
+        None,
+        "--batch-size",
+        min=1,
+        help="Number of buffered nodes/relationships before flushing to Memgraph (only used with --slow)",
+    ),
+) -> None:
+    """Load a binary protobuf index into Memgraph.
+
+    This command reads binary index files created by the 'index' command
+    and loads them directly into Memgraph, bypassing the need to re-parse
+    the entire codebase.
+
+    By default, uses fast CSV bulk loading via LOAD CSV (requires the
+    ./shared-data:/import Docker volume mount). Use --slow to fall back
+    to individual MERGE queries if CSV loading is not available.
+
+    Examples:
+        # INSTANT: Load nodes only (~1 second) - sufficient for most queries
+        graph-code load-index /path/to/index --clean --nodes-only
+
+        # Full load with relationships (~7 minutes)
+        graph-code load-index /path/to/index --clean
+
+        # Use slow mode if Docker volume not mounted
+        graph-code load-index /path/to/index --clean --slow
+    """
+    from pathlib import Path
+    from rich.progress import Progress, SpinnerColumn, TextColumn, BarColumn
+    import time
+
+    try:
+        reader = ProtobufIndexReader(index_path)
+        mode = reader.detect_mode()
+        console.print(f"[bold cyan]Detected index mode: {mode}[/bold cyan]")
+        console.print(f"[bold green]Loading index from: {reader.index_path}[/bold green]")
+
+        # Load the protobuf data
+        nodes, relationships = reader.load()
+
+        console.print(
+            f"[bold cyan]Found {len(nodes):,} nodes and {len(relationships):,} relationships[/bold cyan]"
+        )
+
+        if fast:
+            # Fast CSV bulk loading path
+            console.print("[bold cyan]Using fast CSV bulk loading...[/bold cyan]")
+
+            # Export to shared-data directory (Docker mounted as /import)
+            shared_dir = Path(__file__).parent.parent / "shared-data"
+            shared_dir.mkdir(parents=True, exist_ok=True)
+
+            console.print("[cyan]Exporting protobuf to CSV...[/cyan]")
+            start_time = time.time()
+            node_files, rels_path = reader.export_to_csv(shared_dir)
+            export_time = time.time() - start_time
+            console.print(f"[green]CSV export completed in {export_time:.1f}s[/green]")
+
+            with MemgraphIngestor(
+                host=settings.MEMGRAPH_HOST,
+                port=settings.MEMGRAPH_PORT,
+            ) as ingestor:
+                if clean:
+                    console.print("[bold yellow]Cleaning database...[/bold yellow]")
+                    ingestor.clean_database()
+
+                console.print("[bold cyan]Ensuring constraints...[/bold cyan]")
+                ingestor.ensure_constraints()
+
+                if nodes_only:
+                    console.print("[cyan]Loading nodes only (skipping relationships)...[/cyan]")
+                else:
+                    console.print("[cyan]Loading via LOAD CSV...[/cyan]")
+                start_time = time.time()
+                stats = ingestor.bulk_load_csv(node_files, rels_path, skip_relationships=nodes_only)
+                load_time = time.time() - start_time
+
+            # Summary for fast mode
+            console.print(f"\n[bold green]✓ Index loaded successfully in {load_time:.1f}s![/bold green]")
+            console.print(f"  Nodes: {stats['nodes']:,} loaded")
+            console.print(f"  Relationships: {stats['relationships']:,} loaded")
+            if stats.get('nodes_failed') or stats.get('rels_failed'):
+                console.print(f"  [yellow]Warnings: {stats.get('nodes_failed', 0)} node labels failed, {stats.get('rels_failed', 0)} rel types failed[/yellow]")
+
+        else:
+            # Slow individual MERGE path (original implementation)
+            console.print("[bold yellow]Using slow individual MERGE queries...[/bold yellow]")
+            effective_batch_size = settings.resolve_batch_size(batch_size)
+
+            with MemgraphIngestor(
+                host=settings.MEMGRAPH_HOST,
+                port=settings.MEMGRAPH_PORT,
+                batch_size=effective_batch_size,
+            ) as ingestor:
+                if clean:
+                    console.print("[bold yellow]Cleaning database...[/bold yellow]")
+                    ingestor.clean_database()
+
+                console.print("[bold cyan]Ensuring constraints...[/bold cyan]")
+                ingestor.ensure_constraints()
+
+                # Load nodes with progress bar
+                with Progress(
+                    SpinnerColumn(),
+                    TextColumn("[progress.description]{task.description}"),
+                    BarColumn(),
+                    TextColumn("[progress.percentage]{task.percentage:>3.0f}%"),
+                    TextColumn("({task.completed}/{task.total})"),
+                    console=console,
+                ) as progress:
+                    node_task = progress.add_task(
+                        "[green]Loading nodes...", total=len(nodes)
+                    )
+
+                    nodes_loaded = 0
+                    nodes_skipped = 0
+                    for node in nodes:
+                        result = reader.extract_node_data(node)
+                        if result:
+                            label, properties = result
+                            ingestor.ensure_node_batch(label, properties)
+                            nodes_loaded += 1
+                        else:
+                            nodes_skipped += 1
+                        progress.update(node_task, advance=1)
+
+                    # Flush remaining nodes before loading relationships
+                    ingestor.flush_nodes()
+
+                    rel_task = progress.add_task(
+                        "[blue]Loading relationships...", total=len(relationships)
+                    )
+
+                    rels_loaded = 0
+                    rels_skipped = 0
+                    for rel in relationships:
+                        result = reader.extract_relationship_data(rel)
+                        if result:
+                            from_spec, rel_type, to_spec, props = result
+                            ingestor.ensure_relationship_batch(
+                                from_spec, rel_type, to_spec, props if props else None
+                            )
+                            rels_loaded += 1
+                        else:
+                            rels_skipped += 1
+                        progress.update(rel_task, advance=1)
+
+            # Summary for slow mode
+            console.print("\n[bold green]✓ Index loaded successfully![/bold green]")
+            console.print(f"  Nodes: {nodes_loaded:,} loaded, {nodes_skipped:,} skipped")
+            console.print(f"  Relationships: {rels_loaded:,} loaded, {rels_skipped:,} skipped")
+
+    except FileNotFoundError as e:
+        console.print(f"[bold red]Error: {e}[/bold red]")
+        raise typer.Exit(1)
+    except Exception as e:
+        console.print(f"[bold red]An error occurred while loading index: {e}[/bold red]")
+        logger.error("Index loading failed", exc_info=True)
         raise typer.Exit(1)
 
 

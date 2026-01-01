@@ -43,59 +43,91 @@ def create_query_tool(
         - "Which files contain functions related to database operations"
         """
         logger.info(f"[Tool:QueryGraph] Received NL query: '{natural_language_query}'")
+
+        max_retries = 3
         cypher_query = "N/A"
-        try:
-            cypher_query = await cypher_gen.generate(natural_language_query)
+        last_error = None
 
-            results = ingestor.fetch_all(cypher_query)
-
-            if results:
-                table = Table(
-                    show_header=True,
-                    header_style="bold magenta",
-                )
-                headers = results[0].keys()
-                for header in headers:
-                    table.add_column(header)
-
-                for row in results:
-                    renderable_values = []
-                    for value in row.values():
-                        if value is None:
-                            renderable_values.append("")
-                        elif isinstance(value, bool):
-                            renderable_values.append("✓" if value else "✗")
-                        elif isinstance(value, int | float):
-                            renderable_values.append(str(value))
-                        else:
-                            renderable_values.append(str(value))
-                    table.add_row(*renderable_values)
-
-                console.print(
-                    Panel(
-                        table,
-                        title="[bold blue]Cypher Query Results[/bold blue]",
-                        expand=False,
+        for attempt in range(max_retries):
+            try:
+                # Generate or fix the query
+                if attempt == 0:
+                    cypher_query = await cypher_gen.generate(natural_language_query)
+                else:
+                    console.print(
+                        f"[yellow]⚡ Retry {attempt}/{max_retries - 1}: Attempting to fix Cypher query...[/yellow]"
                     )
-                )
+                    cypher_query = await cypher_gen.fix_query(
+                        cypher_query, str(last_error), natural_language_query
+                    )
 
-            summary = f"Successfully retrieved {len(results)} item(s) from the graph."
-            return GraphData(query_used=cypher_query, results=results, summary=summary)
-        except LLMGenerationError as e:
-            return GraphData(
-                query_used="N/A",
-                results=[],
-                summary=f"I couldn't translate your request into a database query. Error: {e}",
-            )
-        except Exception as e:
-            logger.error(
-                f"[Tool:QueryGraph] Error during query execution: {e}", exc_info=True
-            )
-            return GraphData(
-                query_used=cypher_query,
-                results=[],
-                summary=f"There was an error querying the database: {e}",
-            )
+                # Execute the query
+                results = ingestor.fetch_all(cypher_query)
+
+                # Display results
+                if results:
+                    table = Table(
+                        show_header=True,
+                        header_style="bold magenta",
+                    )
+                    headers = results[0].keys()
+                    for header in headers:
+                        table.add_column(header)
+
+                    for row in results:
+                        renderable_values = []
+                        for value in row.values():
+                            if value is None:
+                                renderable_values.append("")
+                            elif isinstance(value, bool):
+                                renderable_values.append("✓" if value else "✗")
+                            elif isinstance(value, int | float):
+                                renderable_values.append(str(value))
+                            else:
+                                renderable_values.append(str(value))
+                        table.add_row(*renderable_values)
+
+                    console.print(
+                        Panel(
+                            table,
+                            title="[bold blue]Cypher Query Results[/bold blue]",
+                            expand=False,
+                        )
+                    )
+
+                summary = f"Successfully retrieved {len(results)} item(s) from the graph."
+                if attempt > 0:
+                    summary += f" (fixed after {attempt} retry/retries)"
+                return GraphData(query_used=cypher_query, results=results, summary=summary)
+
+            except LLMGenerationError as e:
+                return GraphData(
+                    query_used="N/A",
+                    results=[],
+                    summary=f"I couldn't translate your request into a database query. Error: {e}",
+                )
+            except Exception as e:
+                last_error = e
+                logger.warning(
+                    f"[Tool:QueryGraph] Query attempt {attempt + 1} failed: {e}"
+                )
+                # If this was the last attempt, return the error
+                if attempt == max_retries - 1:
+                    logger.error(
+                        f"[Tool:QueryGraph] All {max_retries} attempts failed", exc_info=True
+                    )
+                    return GraphData(
+                        query_used=cypher_query,
+                        results=[],
+                        summary=f"Query failed after {max_retries} attempts. Last error: {e}",
+                    )
+
+        # Should never reach here, but just in case
+        return GraphData(
+            query_used=cypher_query,
+            results=[],
+            summary="Unexpected error in query loop",
+        )
 
     return Tool(
         function=query_codebase_knowledge_graph,
