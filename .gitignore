@@ -15,3 +15,9 @@ wheels/
 .pytest_cache/
 .claude/
 .qdrant_code_embeddings/
+
+# Runtime data (not committed)
+.cache/
+config/
+shared-data/
+tmp/
