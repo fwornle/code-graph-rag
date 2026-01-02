@@ -82,6 +82,105 @@ The system consists of two main components:
 2. **RAG System** (`codebase_rag/`): Interactive CLI for querying the stored knowledge graph
 
 
+## 📦 Cache Management
+
+The indexing process creates CSV files in `shared-data/` which are loaded into Memgraph via `LOAD CSV`. For the **coding** repository (and other frequently-indexed repos), pre-built caches are available via GitHub Releases to avoid the 15-20 minute indexing time on fresh installations.
+
+### Cache Architecture
+
+```
+shared-data/                    # Staging area for LOAD CSV
+├── nodes/
+│   ├── function.csv           # Function definitions
+│   ├── class.csv              # Class definitions
+│   └── method.csv             # Method definitions
+├── relationships.csv          # Call graph and dependencies
+└── cache-metadata.json        # Commit hash, timestamp, stats
+           ↓
+    LOAD CSV → Memgraph
+           ↓
+memgraph-data volume           # Persistent graph storage
+```
+
+### Pre-Built Cache (coding repo)
+
+On fresh installations, the `install.sh` script automatically downloads a pre-built cache from GitHub Releases:
+
+```bash
+# Cache download happens automatically during install
+./install.sh
+
+# Cache location after download
+integrations/code-graph-rag/shared-data/
+```
+
+### Cache Staleness Detection
+
+The cache tracks which commit it was indexed from. The health monitoring system checks cache freshness:
+
+```bash
+# Check cache staleness manually
+./scripts/check-cache-staleness.sh /path/to/repo
+
+# Output: JSON with status, commits_behind, is_stale
+{
+  "status": "fresh",
+  "commits_behind": 5,
+  "threshold": 50,
+  "is_stale": false
+}
+```
+
+**Staleness Levels:**
+- **Fresh** (0-50 commits behind) - No action needed
+- **Stale** (>50 commits behind) - Reindexing recommended
+- **Diverged** (commit not in history) - Reindexing required
+
+### Creating Cache Releases
+
+For maintainers creating new cache releases:
+
+```bash
+# 1. Index the repository
+uv run graph-code load-index /path/to/repo
+
+# 2. Package the cache
+./scripts/package-cache.sh repo-name /path/to/repo
+
+# 3. Create GitHub release
+gh release create v1.0.0-cache-repo-name \
+  dist/cgr-cache-repo-name-abc1234.tar.gz \
+  --title "CGR Cache: repo-name" \
+  --notes "Pre-indexed cache for repo-name (commit: abc1234)"
+```
+
+### Individual Repository Caches
+
+Each user can index their own repositories. The cache persists in the Docker volume:
+
+```bash
+# Index your project (15-20 minutes for large repos)
+uv run graph-code load-index /path/to/your-project
+
+# Cache is stored in shared-data/ and loaded into Memgraph
+# Persisted via Docker volume: code-graph-rag-memgraph-data
+```
+
+### Re-Indexing
+
+Reindexing is recommended when:
+- Cache shows >50 commits behind
+- Major code restructuring occurred
+- Graph queries return stale results
+
+```bash
+# Via MCP tool (background)
+POST http://localhost:3033/api/cgr/reindex
+
+# Via CLI (foreground)
+uv run graph-code load-index /path/to/repo
+```
+
 ## 📋 Prerequisites
 
 - Python 3.12+
