@@ -10,7 +10,9 @@ set -e
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 CGR_ROOT="$(dirname "$SCRIPT_DIR")"
-REPO_PATH="${1:-/Users/q284340/Agentic/coding}"
+# Default to coding repo (2 levels up from scripts dir in integrations/code-graph-rag)
+DEFAULT_REPO_PATH="${CODING_TOOLS_PATH:-${CODING_REPO:-$(dirname "$(dirname "$CGR_ROOT")")}}"
+REPO_PATH="${1:-$DEFAULT_REPO_PATH}"
 REPO_NAME="${2:-coding}"
 PROGRESS_FILE="$CGR_ROOT/shared-data/reindex-progress.json"
 LOG_FILE="$CGR_ROOT/shared-data/reindex.log"
