@@ -617,6 +617,55 @@ claude mcp add --transport stdio graph-code \
 
 For detailed setup, see [Claude Code Setup Guide](docs/claude-code-setup.md).
 
+### Docker Deployment (HTTP/SSE Mode)
+
+For containerized deployments, code-graph-rag supports HTTP/SSE transport:
+
+```bash
+# Start as SSE server (Docker mode)
+python -m codebase_rag.mcp.sse_server
+
+# Or via uv:
+uv run python -m codebase_rag.mcp.sse_server
+```
+
+**HTTP/SSE Endpoints:**
+- `GET /health` - Health check endpoint
+- `GET /sse` - Server-Sent Events connection
+- `POST /messages` - JSON-RPC message endpoint
+
+**Port Configuration:**
+- Default: `3850` (configurable via `CODE_GRAPH_RAG_SSE_PORT` or `CODE_GRAPH_RAG_PORT`)
+
+**Health Check:**
+```bash
+curl http://localhost:3850/health
+# {"status":"ok","server":"code-graph-rag-mcp"}
+```
+
+**Claude Code Integration (Docker Mode):**
+
+In Docker mode, Claude connects via a lightweight stdio proxy:
+```json
+{
+  "code-graph-rag": {
+    "command": "python",
+    "args": ["-m", "codebase_rag.mcp.stdio_proxy"],
+    "env": {
+      "CODE_GRAPH_RAG_SSE_URL": "http://localhost:3850"
+    }
+  }
+}
+```
+
+**Memgraph Database:**
+
+The code graph requires Memgraph for storage. In Docker mode, Memgraph runs as a separate container:
+- Bolt Protocol: Port `7687`
+- Memgraph Lab UI: Port `3100`
+
+See the parent [Docker Deployment Guide](../../docker/README.md) for full containerization setup.
+
 ## 📊 Graph Schema
 
 The knowledge graph uses the following node types and relationships:

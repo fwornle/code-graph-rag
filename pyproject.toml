@@ -22,11 +22,16 @@ dependencies = [
     "click>=8.0.0",
     "pytest-xdist>=3.8.0",
     "protobuf>=5.27.0",
+    "starlette>=0.41.0",
+    "uvicorn>=0.32.0",
+    "httpx>=0.27.0",
 ]
 
 [project.scripts]
 graph-code = "codebase_rag.main:app"
 cgr = "codebase_rag.main:app"
+graph-code-sse = "codebase_rag.mcp.sse_server:main"
+graph-code-proxy = "codebase_rag.mcp.stdio_proxy:main"
 
 [tool.uv]
 package = true
