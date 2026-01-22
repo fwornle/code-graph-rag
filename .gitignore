@@ -21,3 +21,6 @@ wheels/
 config/
 shared-data/
 tmp/
+
+# Lock files
+uv.lock
