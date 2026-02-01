@@ -6,12 +6,10 @@ This server runs as a single persistent process that multiple Claude Code sessio
 can connect to via HTTP/SSE transport. Designed for containerized deployments.
 """
 
-import asyncio
 import json
 import os
 import sys
 import time
-import uuid
 from typing import Any
 
 from loguru import logger
@@ -21,7 +19,7 @@ from mcp.types import TextContent, Tool
 from starlette.applications import Starlette
 from starlette.requests import Request
 from starlette.responses import JSONResponse, Response
-from starlette.routing import Route
+from starlette.routing import Mount, Route
 import uvicorn
 
 from codebase_rag.config import settings
@@ -46,9 +44,12 @@ PORT = int(os.environ.get("CODE_GRAPH_RAG_PORT", "3850"))
 ingestor: MemgraphIngestor | None = None
 tools: Any = None
 
-# Store transports and servers by session ID
-transports: dict[str, SseServerTransport] = {}
-servers: dict[str, Server] = {}
+# Single shared transport for all sessions
+# The transport internally manages session IDs and routing
+sse_transport = SseServerTransport("/messages")
+
+# Track active session count for health endpoint
+active_sessions = 0
 
 # Server startup time
 server_start_time = time.time()
@@ -149,7 +150,7 @@ async def health_endpoint(request: Request) -> JSONResponse:
     return JSONResponse({
         "status": "ok",
         "service": "code-graph-rag",
-        "sessions": len(transports),
+        "sessions": active_sessions,
         "initialized": ingestor is not None,
         "uptime": int(time.time() - server_start_time),
     })
@@ -157,62 +158,42 @@ async def health_endpoint(request: Request) -> JSONResponse:
 
 async def sse_endpoint(request: Request) -> Response:
     """SSE endpoint for establishing the stream."""
+    global active_sessions
+
     logger.info("New SSE connection request")
 
-    session_id = str(uuid.uuid4())
-
-    transport = SseServerTransport("/messages")
-    transports[session_id] = transport
-
+    # Create a new MCP server for this session
     server = create_mcp_server()
-    servers[session_id] = server
 
-    async def handle_sse():
-        try:
-            # The transport handles the SSE connection
-            async with transport.connect_sse(
-                request.scope,
-                request.receive,
-                request._send,
-            ) as (read_stream, write_stream):
-                await server.run(read_stream, write_stream, server.create_initialization_options())
-        except Exception as e:
-            logger.error(f"SSE session error: {e}")
-        finally:
-            # Cleanup
-            if session_id in transports:
-                del transports[session_id]
-            if session_id in servers:
-                del servers[session_id]
-            logger.info(f"SSE session {session_id} ended")
-
-    return await transport.handle_sse(request.scope, request.receive, request._send)
-
-
-async def messages_endpoint(request: Request) -> Response:
-    """Messages endpoint for receiving client JSON-RPC requests."""
-    session_id = request.query_params.get("sessionId")
-
-    if not session_id:
-        return Response("Missing sessionId parameter", status_code=400)
-
-    transport = transports.get(session_id)
-    if not transport:
-        logger.error(f"No active transport found for session ID: {session_id}")
-        return Response("Session not found", status_code=404)
+    active_sessions += 1
+    logger.info(f"Active sessions: {active_sessions}")
 
     try:
-        return await transport.handle_post_message(request.scope, request.receive, request._send)
+        # The shared transport handles the SSE connection
+        # It internally generates and manages the session ID
+        async with sse_transport.connect_sse(
+            request.scope,
+            request.receive,
+            request._send,
+        ) as (read_stream, write_stream):
+            logger.info("SSE session connected")
+            await server.run(read_stream, write_stream, server.create_initialization_options())
     except Exception as e:
-        logger.error(f"Error handling request: {e}")
-        return Response("Error handling request", status_code=500)
+        logger.error(f"SSE session error: {e}", exc_info=True)
+    finally:
+        active_sessions -= 1
+        logger.info(f"SSE session ended. Active sessions: {active_sessions}")
+
+    # Return empty Response to avoid NoneType error when client disconnects
+    return Response()
 
 
 # Define routes
+# Note: /messages uses Mount with the transport's handle_post_message ASGI app
 routes = [
     Route("/health", health_endpoint, methods=["GET"]),
     Route("/sse", sse_endpoint, methods=["GET"]),
-    Route("/messages", messages_endpoint, methods=["POST"]),
+    Mount("/messages", app=sse_transport.handle_post_message),
 ]
 
 app = Starlette(routes=routes)
