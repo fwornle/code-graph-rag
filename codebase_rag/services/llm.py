@@ -8,6 +8,7 @@ from ..prompts import (
     RAG_ORCHESTRATOR_SYSTEM_PROMPT,
 )
 from ..providers.base import get_provider
+from ..utils.usage_cost_reporter import report_usage_cost
 
 
 class LLMGenerationError(Exception):
@@ -68,6 +69,21 @@ class CypherGenerator:
         )
         try:
             result = await self.agent.run(natural_language_query)
+
+            # Report usage to central BudgetTracker
+            try:
+                usage = result.usage()
+                config = settings.active_cypher_config
+                report_usage_cost(
+                    provider="groq",
+                    model=config.model_id,
+                    input_tokens=usage.request_tokens or 0,
+                    output_tokens=usage.response_tokens or 0,
+                    source="code-graph-rag:cypher-generate",
+                )
+            except Exception as ue:
+                logger.warning(f"Failed to report usage cost: {ue}")
+
             if (
                 not isinstance(result.output, str)
                 or "MATCH" not in result.output.upper()
@@ -79,6 +95,8 @@ class CypherGenerator:
             query = _clean_cypher_response(result.output)
             logger.info(f"  [CypherGenerator] Generated Cypher: {query}")
             return query
+        except LLMGenerationError:
+            raise
         except Exception as e:
             logger.error(f"  [CypherGenerator] Error: {e}")
             raise LLMGenerationError(f"Cypher generation failed: {e}") from e
@@ -101,15 +119,39 @@ Generate ONLY a corrected Cypher query. Use simple, valid Cypher syntax.
 Avoid complex patterns - prefer multiple simple MATCH clauses over complex path expressions.
 Do NOT use variable-length paths like *1..3 unless absolutely necessary.
 """
-        logger.info(f"  [CypherGenerator] Attempting to fix query after error: {error_message[:100]}...")
+        logger.info(
+            f"  [CypherGenerator] Attempting to fix query after error: {error_message[:100]}..."
+        )
         try:
             result = await self.agent.run(fix_prompt)
-            if not isinstance(result.output, str) or "MATCH" not in result.output.upper():
-                raise LLMGenerationError(f"Fix attempt did not produce valid query: {result.output}")
+
+            # Report usage to central BudgetTracker
+            try:
+                usage = result.usage()
+                config = settings.active_cypher_config
+                report_usage_cost(
+                    provider="groq",
+                    model=config.model_id,
+                    input_tokens=usage.request_tokens or 0,
+                    output_tokens=usage.response_tokens or 0,
+                    source="code-graph-rag:cypher-fix",
+                )
+            except Exception as ue:
+                logger.warning(f"Failed to report usage cost: {ue}")
+
+            if (
+                not isinstance(result.output, str)
+                or "MATCH" not in result.output.upper()
+            ):
+                raise LLMGenerationError(
+                    f"Fix attempt did not produce valid query: {result.output}"
+                )
 
             query = _clean_cypher_response(result.output)
             logger.info(f"  [CypherGenerator] Fixed Cypher: {query}")
             return query
+        except LLMGenerationError:
+            raise
         except Exception as e:
             logger.error(f"  [CypherGenerator] Fix attempt failed: {e}")
             raise LLMGenerationError(f"Query fix failed: {e}") from e

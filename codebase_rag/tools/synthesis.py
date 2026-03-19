@@ -8,13 +8,16 @@ from pydantic import BaseModel, Field
 from pydantic_ai import Agent, Tool
 
 from ..services import QueryProtocol
+from ..utils.usage_cost_reporter import report_usage_cost
 
 
 class AnalysisSynthesis(BaseModel):
     """Result of comprehensive code analysis."""
 
     entity_name: str = Field(description="Fully qualified name of the analyzed entity")
-    entity_type: str = Field(description="Type of entity (Function, Class, Method, Module)")
+    entity_type: str = Field(
+        description="Type of entity (Function, Class, Method, Module)"
+    )
     purpose: str = Field(description="LLM-generated description of what the code does")
     components: list[str] = Field(
         default_factory=list, description="Key sub-components or methods"
@@ -38,7 +41,9 @@ class AnalysisSynthesis(BaseModel):
         default="", description="Aggregated documentation and comments"
     )
     success: bool = Field(default=True, description="Whether analysis succeeded")
-    error_message: str = Field(default="", description="Error message if analysis failed")
+    error_message: str = Field(
+        default="", description="Error message if analysis failed"
+    )
 
 
 class ComprehensiveAnalyzer:
@@ -76,7 +81,9 @@ class ComprehensiveAnalyzer:
         Returns:
             AnalysisSynthesis with comprehensive insights
         """
-        logger.info(f"[ComprehensiveAnalyzer] Analyzing: {qualified_name} (scope: {scope})")
+        logger.info(
+            f"[ComprehensiveAnalyzer] Analyzing: {qualified_name} (scope: {scope})"
+        )
 
         try:
             # Step 1: Query graph for structure and type
@@ -118,7 +125,9 @@ class ComprehensiveAnalyzer:
             return synthesis
 
         except Exception as e:
-            logger.error(f"[ComprehensiveAnalyzer] Error analyzing {qualified_name}: {e}")
+            logger.error(
+                f"[ComprehensiveAnalyzer] Error analyzing {qualified_name}: {e}"
+            )
             return AnalysisSynthesis(
                 entity_name=qualified_name,
                 entity_type="Unknown",
@@ -196,7 +205,9 @@ class ComprehensiveAnalyzer:
                 RETURN parent.qualified_name AS qn, labels(parent)[0] AS type, parent.docstring AS docstring
             """
             try:
-                results = self.ingestor.fetch_all(inherits_query, {"qn": qualified_name})
+                results = self.ingestor.fetch_all(
+                    inherits_query, {"qn": qualified_name}
+                )
                 relationships["inherits"] = results or []
             except Exception as e:
                 logger.debug(f"Error fetching inheritance: {e}")
@@ -209,7 +220,9 @@ class ComprehensiveAnalyzer:
                 LIMIT 20
             """
             try:
-                results = self.ingestor.fetch_all(inherited_by_query, {"qn": qualified_name})
+                results = self.ingestor.fetch_all(
+                    inherited_by_query, {"qn": qualified_name}
+                )
                 relationships["inherited_by"] = results or []
             except Exception as e:
                 logger.debug(f"Error fetching children: {e}")
@@ -222,7 +235,9 @@ class ComprehensiveAnalyzer:
                 LIMIT 30
             """
             try:
-                results = self.ingestor.fetch_all(contains_query, {"qn": qualified_name})
+                results = self.ingestor.fetch_all(
+                    contains_query, {"qn": qualified_name}
+                )
                 relationships["contains"] = results or []
             except Exception as e:
                 logger.debug(f"Error fetching methods: {e}")
@@ -276,7 +291,9 @@ class ComprehensiveAnalyzer:
         # Related entity docs (brief summaries)
         for method in relationships.get("contains", [])[:10]:
             if method.get("docstring"):
-                docs_parts.append(f"  - {method.get('name')}: {method['docstring'][:100]}")
+                docs_parts.append(
+                    f"  - {method.get('name')}: {method['docstring'][:100]}"
+                )
 
         return "\n".join(docs_parts)
 
@@ -293,10 +310,18 @@ class ComprehensiveAnalyzer:
         """Use LLM to generate comprehensive analysis."""
 
         # Build relationship summaries
-        calls_summary = ", ".join([r.get("qn", "") for r in relationships["calls"][:10]])
-        called_by_summary = ", ".join([r.get("qn", "") for r in relationships["called_by"][:10]])
-        inherits_summary = ", ".join([r.get("qn", "") for r in relationships["inherits"]])
-        contains_summary = ", ".join([r.get("name", "") for r in relationships["contains"][:15]])
+        calls_summary = ", ".join(
+            [r.get("qn", "") for r in relationships["calls"][:10]]
+        )
+        called_by_summary = ", ".join(
+            [r.get("qn", "") for r in relationships["called_by"][:10]]
+        )
+        inherits_summary = ", ".join(
+            [r.get("qn", "") for r in relationships["inherits"]]
+        )
+        contains_summary = ", ".join(
+            [r.get("name", "") for r in relationships["contains"][:15]]
+        )
 
         prompt = f"""Analyze this code entity and provide insights in a structured format.
 
@@ -327,6 +352,23 @@ ISSUES: [comma-separated list of potential risks or concerns, or "None identifie
 
         try:
             result = await self.synthesis_agent.run(prompt)
+
+            # Report usage to central BudgetTracker
+            try:
+                from ..config import settings
+
+                usage = result.usage()
+                config = settings.active_cypher_config
+                report_usage_cost(
+                    provider="groq",
+                    model=config.model_id,
+                    input_tokens=usage.request_tokens or 0,
+                    output_tokens=usage.response_tokens or 0,
+                    source="code-graph-rag:synthesis",
+                )
+            except Exception as ue:
+                logger.warning(f"Failed to report usage cost: {ue}")
+
             return self._parse_synthesis_response(
                 qualified_name, entity_type, docs, result.output
             )
@@ -367,14 +409,18 @@ ISSUES: [comma-separated list of potential risks or concerns, or "None identifie
                 result.components = [c.strip() for c in items.split(",") if c.strip()]
             elif line.startswith("PATTERNS:"):
                 items = line[9:].strip()
-                result.patterns_identified = [p.strip() for p in items.split(",") if p.strip()]
+                result.patterns_identified = [
+                    p.strip() for p in items.split(",") if p.strip()
+                ]
             elif line.startswith("DEPENDENCIES:"):
                 items = line[13:].strip()
                 result.dependencies = [d.strip() for d in items.split(",") if d.strip()]
             elif line.startswith("ISSUES:"):
                 items = line[7:].strip()
                 if items.lower() != "none identified":
-                    result.potential_issues = [i.strip() for i in items.split(",") if i.strip()]
+                    result.potential_issues = [
+                        i.strip() for i in items.split(",") if i.strip()
+                    ]
 
         # If purpose wasn't parsed, use the whole response
         if not result.purpose:

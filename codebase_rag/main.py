@@ -31,7 +31,11 @@ from .graph_updater import GraphUpdater
 from .parser_loader import load_parsers
 from .services import QueryProtocol
 from .services.graph_service import MemgraphIngestor
-from .services.llm import CypherGenerator, create_rag_orchestrator, create_synthesis_agent
+from .services.llm import (
+    CypherGenerator,
+    create_rag_orchestrator,
+    create_synthesis_agent,
+)
 from .services.protobuf_service import ProtobufFileIngestor, ProtobufIndexReader
 from .tools.code_retrieval import CodeRetriever, create_code_retrieval_tool
 from .tools.codebase_query import create_query_tool
@@ -47,6 +51,7 @@ from .tools.semantic_search import (
 )
 from .tools.shell_command import ShellCommander, create_shell_command_tool
 from .tools.synthesis import ComprehensiveAnalyzer, create_comprehensive_analysis_tool
+from .utils.usage_cost_reporter import report_usage_cost
 
 confirm_edits_globally = True
 
@@ -66,9 +71,9 @@ def _parse_llama_tool_call(failed_generation: str) -> tuple[str, dict[str, Any]]
     """
     # Try multiple regex patterns to handle format variations
     patterns = [
-        r"<function=(\w+)\s*(\{.*?\})</function>",      # Standard: tool_name{...}
-        r"<function=(\w+)=\s*(\{.*?\})</function>",     # With extra =: tool_name={...}
-        r"<function=(\w+)\s+(\{.*?\})</function>",      # With space: tool_name {...}
+        r"<function=(\w+)\s*(\{.*?\})</function>",  # Standard: tool_name{...}
+        r"<function=(\w+)=\s*(\{.*?\})</function>",  # With extra =: tool_name={...}
+        r"<function=(\w+)\s+(\{.*?\})</function>",  # With space: tool_name {...}
     ]
 
     for pattern in patterns:
@@ -420,6 +425,21 @@ Remember: Propose changes first, wait for my approval, then implement.
 
                 log_session_event(f"ASSISTANT: {response.output}")
                 message_history.extend(response.new_messages())
+
+                # Report usage to central BudgetTracker
+                try:
+                    usage = response.usage()
+                    config = settings.active_orchestrator_config
+                    report_usage_cost(
+                        provider="groq",
+                        model=config.model_id,
+                        input_tokens=usage.request_tokens or 0,
+                        output_tokens=usage.response_tokens or 0,
+                        source="code-graph-rag:optimization-agent",
+                    )
+                except Exception as ue:
+                    logger.warning(f"Failed to report usage cost: {ue}")
+
                 break
 
             first_run = False
@@ -659,6 +679,21 @@ async def run_chat_loop(
 
                 log_session_event(f"ASSISTANT: {response.output}")
                 message_history.extend(response.new_messages())
+
+                # Report usage to central BudgetTracker
+                try:
+                    usage = response.usage()
+                    config = settings.active_orchestrator_config
+                    report_usage_cost(
+                        provider="groq",
+                        model=config.model_id,
+                        input_tokens=usage.request_tokens or 0,
+                        output_tokens=usage.response_tokens or 0,
+                        source="code-graph-rag:chat-agent",
+                    )
+                except Exception as ue:
+                    logger.warning(f"Failed to report usage cost: {ue}")
+
                 break
 
         except KeyboardInterrupt:
@@ -1088,7 +1123,9 @@ def load_index(
         reader = ProtobufIndexReader(index_path)
         mode = reader.detect_mode()
         console.print(f"[bold cyan]Detected index mode: {mode}[/bold cyan]")
-        console.print(f"[bold green]Loading index from: {reader.index_path}[/bold green]")
+        console.print(
+            f"[bold green]Loading index from: {reader.index_path}[/bold green]"
+        )
 
         # Load the protobuf data
         nodes, relationships = reader.load()
@@ -1123,23 +1160,33 @@ def load_index(
                 ingestor.ensure_constraints()
 
                 if nodes_only:
-                    console.print("[cyan]Loading nodes only (skipping relationships)...[/cyan]")
+                    console.print(
+                        "[cyan]Loading nodes only (skipping relationships)...[/cyan]"
+                    )
                 else:
                     console.print("[cyan]Loading via LOAD CSV...[/cyan]")
                 start_time = time.time()
-                stats = ingestor.bulk_load_csv(node_files, rels_path, skip_relationships=nodes_only)
+                stats = ingestor.bulk_load_csv(
+                    node_files, rels_path, skip_relationships=nodes_only
+                )
                 load_time = time.time() - start_time
 
             # Summary for fast mode
-            console.print(f"\n[bold green]✓ Index loaded successfully in {load_time:.1f}s![/bold green]")
+            console.print(
+                f"\n[bold green]✓ Index loaded successfully in {load_time:.1f}s![/bold green]"
+            )
             console.print(f"  Nodes: {stats['nodes']:,} loaded")
             console.print(f"  Relationships: {stats['relationships']:,} loaded")
-            if stats.get('nodes_failed') or stats.get('rels_failed'):
-                console.print(f"  [yellow]Warnings: {stats.get('nodes_failed', 0)} node labels failed, {stats.get('rels_failed', 0)} rel types failed[/yellow]")
+            if stats.get("nodes_failed") or stats.get("rels_failed"):
+                console.print(
+                    f"  [yellow]Warnings: {stats.get('nodes_failed', 0)} node labels failed, {stats.get('rels_failed', 0)} rel types failed[/yellow]"
+                )
 
         else:
             # Slow individual MERGE path (original implementation)
-            console.print("[bold yellow]Using slow individual MERGE queries...[/bold yellow]")
+            console.print(
+                "[bold yellow]Using slow individual MERGE queries...[/bold yellow]"
+            )
             effective_batch_size = settings.resolve_batch_size(batch_size)
 
             with MemgraphIngestor(
@@ -1202,14 +1249,20 @@ def load_index(
 
             # Summary for slow mode
             console.print("\n[bold green]✓ Index loaded successfully![/bold green]")
-            console.print(f"  Nodes: {nodes_loaded:,} loaded, {nodes_skipped:,} skipped")
-            console.print(f"  Relationships: {rels_loaded:,} loaded, {rels_skipped:,} skipped")
+            console.print(
+                f"  Nodes: {nodes_loaded:,} loaded, {nodes_skipped:,} skipped"
+            )
+            console.print(
+                f"  Relationships: {rels_loaded:,} loaded, {rels_skipped:,} skipped"
+            )
 
     except FileNotFoundError as e:
         console.print(f"[bold red]Error: {e}[/bold red]")
         raise typer.Exit(1)
     except Exception as e:
-        console.print(f"[bold red]An error occurred while loading index: {e}[/bold red]")
+        console.print(
+            f"[bold red]An error occurred while loading index: {e}[/bold red]"
+        )
         logger.error("Index loading failed", exc_info=True)
         raise typer.Exit(1)
 
